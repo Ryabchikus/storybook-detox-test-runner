@@ -12,6 +12,11 @@ const WS_OPEN = 1
 const PORT = Number(process.env.STORYBOOK_WS_PORT || 7007)
 const DEBUG = process.env.STORYBOOK_CHANNEL_DEBUG === '1'
 
+// Whether to attempt an automatic app relaunch when WS client does not connect in time.
+// "0" = disabled, anything else / unset = enabled (default).
+const SHOULD_RELAUNCH_ON_WS_TIMEOUT =
+  process.env.STORYBOOK_RELAUNCH_ON_WS_TIMEOUT !== '0'
+
 const log = (...args: unknown[]) => {
   if (DEBUG) {
     // eslint-disable-next-line no-console
@@ -311,6 +316,20 @@ export async function closeChannel() {
 
   channel.routePromise = null
 
+  // Best-effort: undo TCP reverse on Android if supported by Detox.
+  try {
+    if (
+      typeof device.getPlatform === 'function' &&
+      device.getPlatform() === 'android' &&
+      typeof (device as any).unreverseTcpPort === 'function'
+    ) {
+      await (device as any).unreverseTcpPort(PORT)
+      log('unreverseTcpPort ok:', PORT)
+    }
+  } catch (error: any) {
+    log('unreverseTcpPort failed:', error?.message ?? error)
+  }
+
   try {
     channel.client?.socket?.close?.()
   } catch {
@@ -350,23 +369,49 @@ export async function changeStory(storyId: string) {
 
   const connectTimeoutMs = Number(process.env.STORYBOOK_WS_CONNECT_TIMEOUT_MS || 60_000)
   const changeTimeoutMs = Number(process.env.STORYBOOK_CHANGE_STORY_TIMEOUT_MS || 20_000)
-  // If no client or socket closed, try to restart app to force reconnect
-  const existingSocket = getChannel().client?.socket
 
-  if (!existingSocket || (existingSocket as any).readyState !== WS_OPEN) {
-    log('No open socket, restarting app to force reconnect')
+  // Fallback connect timeout after relaunch: shorter than the initial one by default.
+  const fallbackConnectEnv = process.env.STORYBOOK_WS_FALLBACK_CONNECT_TIMEOUT_MS
+  const fallbackConnectTimeoutMs = (() => {
+    const parsed = fallbackConnectEnv != null ? Number(fallbackConnectEnv) : NaN
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed
+    }
+    return Math.min(connectTimeoutMs, 15_000)
+  })()
 
+  let socket: WebSocket
+
+  // 1. Try to use an already-connected Storybook client from the app.
+  try {
+    socket = await waitForOpenClientSocket(connectTimeoutMs)
+  } catch (firstError: any) {
+    if (!SHOULD_RELAUNCH_ON_WS_TIMEOUT) {
+      // Explicitly disabled via env: surface the original timeout error.
+      throw firstError
+    }
+
+    log(
+      'No open Storybook WS client within timeout, trying to relaunch app:',
+      firstError?.message ?? firstError,
+    )
+
+    // 2. Try a single recovery relaunch to force the app to reconnect.
     try {
       await device.launchApp({ newInstance: true })
-    } catch (error: any) {
-      log('launchApp failed:', error?.message ?? error)
+    } catch (launchError: any) {
+      log(
+        'launchApp failed while trying to recover Storybook connection:',
+        launchError?.message ?? launchError,
+      )
+      throw launchError
     }
+
+    // 3. After relaunch, wait again for the client but with a shorter timeout.
+    socket = await waitForOpenClientSocket(fallbackConnectTimeoutMs)
   }
 
-  const socket = await waitForOpenClientSocket(connectTimeoutMs)
-
-  // Create pending BEFORE send to avoid race condition
-  // if STORY_RENDERED arrives before pending is registered.
+  // 4. Register the pending render before sending SET_CURRENT_STORY to avoid races.
   const waitForRender = createPendingRenderPromise(storyId)
 
   try {
@@ -377,7 +422,7 @@ export async function changeStory(storyId: string) {
     if (channel.pendingStory?.storyId === storyId) {
       try {
         channel.pendingStory.reject(
-          new Error('Failed to send SET_CURRENT_STORY: ' + (error?.message ?? String(error)))
+          new Error('Failed to send SET_CURRENT_STORY: ' + (error?.message ?? String(error))),
         )
       } catch {
         // ignore
@@ -398,9 +443,7 @@ export async function changeStory(storyId: string) {
       channel.pendingStory = null
 
       try {
-        pending.reject(
-          error instanceof Error ? error : new Error(String(error))
-        )
+        pending.reject(error instanceof Error ? error : new Error(String(error)))
       } catch {
         // ignore
       }

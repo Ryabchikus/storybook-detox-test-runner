@@ -76,6 +76,66 @@ function generateJestTest (csfFilePath: string, stories: Record<string, StaticSt
     const channel = require('${join(__dirname, '..', 'channel.js')}')
     const detox = require('detox')
 
+    // STORYBOOK_LAUNCH_RETRIES controls how many retries we perform
+    // *after* the first failed launch, for transient Detox disconnect errors.
+    // 0  => no retries
+    // 1  => one retry (total 2 attempts), etc.
+    const _rawRetries = process.env.STORYBOOK_LAUNCH_RETRIES
+    const _parsedRetries = _rawRetries != null ? Number(_rawRetries) : 1
+    const MAX_LAUNCH_RETRIES =
+      Number.isFinite(_parsedRetries) && _parsedRetries >= 0 ? _parsedRetries : 1
+
+    function isDetoxDisconnectedError(error) {
+      if (!error) return false
+      const msg = String(error.message || error)
+
+      // Be tolerant to minor text variations across Detox versions.
+      return (
+        msg.includes('unexpectedly disconnected from Detox server') ||
+        msg.includes("Detox can't seem to connect to the test app") ||
+        msg.includes('The pending request #-1000 ("isReady") has been rejected')
+      )
+    }
+
+    const _sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+    async function launchAppWithRetry(config) {
+      const baseConfig = (config && typeof config === 'object') ? { ...config } : {}
+      const platform = device.getPlatform()
+      let attempt = 0
+
+      // attempt === 0: first launch attempt
+      // 1..MAX_LAUNCH_RETRIES: retry attempts for transient Detox disconnect errors
+      while (true) {
+        try {
+          const effectiveConfig =
+            attempt === 0 || platform !== 'android'
+              ? baseConfig
+              : (
+                  // On Android retries, force newInstance: true only if the user
+                  // did not specify newInstance explicitly in the launch config.
+                  baseConfig.newInstance === undefined
+                    ? { ...baseConfig, newInstance: true }
+                    : baseConfig
+                )
+
+          return await device.launchApp(effectiveConfig)
+        } catch (err) {
+          if (!isDetoxDisconnectedError(err) || attempt >= MAX_LAUNCH_RETRIES) {
+            throw err
+          }
+
+          attempt += 1
+          // Small delay before retrying helps Detox / emulator stabilize after a crash.
+          // eslint-disable-next-line no-console
+          console.warn(
+            \`[storybook-detox] launchApp retry attempt=\${attempt}/\${MAX_LAUNCH_RETRIES} after disconnect\`,
+          )
+          await _sleep(1000)
+        }
+      }
+    }
+
     beforeAll(async () => {
       await channel.routeFromDeviceToServer()
     })
@@ -95,7 +155,7 @@ function generateJestTest (csfFilePath: string, stories: Record<string, StaticSt
 function generateTestForStory (variableName: string, story: StaticStory) {
   return `
     testOrSkip(story.${variableName}.detox?.onlyOnOperatingSystems)('${story.name}', async function () {
-      await device.launchApp(story.${variableName}.detox?.launch)
+      await launchAppWithRetry(story.${variableName}.detox?.launch)
       await channel.changeStory('${story.id}')
       await story.${variableName}.play?.({ detox })
     })\n\n`
