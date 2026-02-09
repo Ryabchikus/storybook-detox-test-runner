@@ -1,3 +1,6 @@
+import { execFileSync } from 'child_process'
+import http from 'http'
+import path from 'path'
 import { device } from 'detox'
 import events, {
   CHANNEL_CREATED,
@@ -7,7 +10,6 @@ import events, {
   STORY_UNCHANGED,
 } from 'storybook/internal/core-events'
 import { WebSocket, WebSocketServer } from 'ws'
-import { execFileSync } from 'child_process'
 
 const WS_OPEN = 1
 const PORT = Number(process.env.STORYBOOK_WS_PORT || 7007)
@@ -15,8 +17,10 @@ const DEBUG = process.env.STORYBOOK_CHANNEL_DEBUG === '1'
 
 // Whether to attempt an automatic app relaunch when WS client does not connect in time.
 // "0" = disabled, anything else / unset = enabled (default).
-const SHOULD_RELAUNCH_ON_WS_TIMEOUT =
-  process.env.STORYBOOK_RELAUNCH_ON_WS_TIMEOUT !== '0'
+const SHOULD_RELAUNCH_ON_WS_TIMEOUT = process.env.STORYBOOK_RELAUNCH_ON_WS_TIMEOUT !== '0'
+
+// Optional: package name for pidof/logcat context in debug dumps.
+const ANDROID_PACKAGE_NAME = process.env.STORYBOOK_ANDROID_PACKAGE
 
 const log = (...args: unknown[]) => {
   if (DEBUG) {
@@ -25,56 +29,166 @@ const log = (...args: unknown[]) => {
   }
 }
 
-function debugLog(...args: any[]) {
-  // Reuse existing DEBUG flag or add your own
-  if (process.env.STORYBOOK_CHANNEL_DEBUG === '1') {
-    // eslint-disable-next-line no-console
-    console.log('[storybook-detox][debug]', ...args)
-  }
+// --- Debug helpers (Android only) --------------------------------------------
+
+const debugLog = (...args: any[]) => {
+  if (!DEBUG) return
+  // eslint-disable-next-line no-console
+  console.log('[storybook-detox][debug]', ...args)
 }
 
-function getAdbDeviceIdFallback(): string | null {
-  // Best-effort: in most CI setups there's only one device.
+const getAdbPath = () => {
+  const sdkRoot = process.env.ANDROID_SDK_ROOT || process.env.ANDROID_HOME
+  return sdkRoot ? path.join(sdkRoot, 'platform-tools', 'adb') : 'adb'
+}
+
+const getSerial = (): string | null => {
+  const id = (device as any)?.id
+  return typeof id === 'string' && id.length > 0 ? id : null
+}
+
+const safeExecAdb = (serial: string, args: string[]) => {
   try {
-    const out = execFileSync('adb', ['devices'], { encoding: 'utf8' })
-    const lines = out.split('\n').map((l) => l.trim()).filter(Boolean)
-    const deviceLines = lines.filter((l) => l.endsWith('\tdevice'))
-    if (deviceLines.length === 1) {
-      return deviceLines[0].split('\t')[0]
-    }
-  } catch {
-    // ignore
-  }
-  return null
-}
-
-function getAdbDeviceId(): string | null {
-  // Prefer Detox env if present, fallback to single-device heuristic.
-  const envId = process.env.DETOX_DEVICE_ID || process.env.DETOX_DEVICE_NAME
-  if (envId && envId.length > 0) {
-    return envId
-  }
-  return getAdbDeviceIdFallback()
-}
-
-export function debugReverseState(tag: string) {
-  if (device.getPlatform?.() !== 'android') {
-    return
-  }
-
-  const serial = getAdbDeviceId()
-  if (!serial) {
-    debugLog(tag, 'debugReverseState: no adb device id found')
-    return
-  }
-
-  try {
-    const out = execFileSync('adb', ['-s', serial, 'reverse', '--list'], { encoding: 'utf8' })
-    debugLog(tag, 'adb reverse --list:\n' + out)
+    return execFileSync(getAdbPath(), ['-s', serial, ...args], { encoding: 'utf8' }).trim()
   } catch (e: any) {
-    debugLog(tag, 'adb reverse --list failed:', e?.message ?? String(e))
+    return `FAILED: ${String(e?.stderr || e?.message || e)}`
   }
 }
+
+const safeExec = (cmd: string, args: string[]) => {
+  try {
+    return execFileSync(cmd, args, { encoding: 'utf8' }).trim()
+  } catch (e: any) {
+    return `FAILED: ${String(e?.stderr || e?.message || e)}`
+  }
+}
+
+// Prevent flooding logs when multiple stories fail in a row
+let lastDumpTs = 0
+const DUMP_THROTTLE_MS = 5000
+
+async function checkMetroStatus(timeoutMs = 1200): Promise<string> {
+  return await new Promise((resolve) => {
+    const req = http.get(
+      {
+        host: '127.0.0.1',
+        port: 8081,
+        path: '/status',
+        timeout: timeoutMs,
+      },
+      (res) => {
+        let data = ''
+        res.on('data', (c) => (data += String(c)))
+        res.on('end', () => resolve(`HTTP ${res.statusCode} ${data.slice(0, 200)}`))
+      },
+    )
+
+    req.on('timeout', () => {
+      req.destroy()
+      resolve('TIMEOUT')
+    })
+
+    req.on('error', (e) => resolve(`ERROR: ${String((e as any)?.message ?? e)}`))
+  })
+}
+
+function pickLogcatHighlights(logcat: string): string {
+  // Keep it very pragmatic: these strings cover 95% of "why didn't it connect?"
+  // You can extend via env without changing code.
+  const extra = String(process.env.STORYBOOK_LOGCAT_HIGHLIGHTS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+  const needles = [
+    'AndroidRuntime',
+    'FATAL EXCEPTION',
+    'ANR in',
+    'OutOfMemoryError',
+    'Unable to load script',
+    'Could not connect to development server',
+    'ReactNativeJS',
+    'Hermes',
+    'SoLoader',
+    'ConnectException',
+    'ECONNREFUSED',
+    'EHOSTUNREACH',
+    'ENETUNREACH',
+    '7007',
+    '8081',
+    '::1',
+    ...extra,
+  ]
+
+  const lines = (logcat || '').split('\n')
+  const matched = lines.filter((l) => needles.some((n) => l.includes(n)))
+
+  // Limit size to avoid blowing up logs
+  return matched.slice(-120).join('\n')
+}
+
+/**
+ * Dumps Android diagnostics to stdout. Best-effort: must never throw.
+ * Call it on timeouts / disconnects only.
+ */
+export async function debugAndroidTimeoutDump(tag: string) {
+  if (!DEBUG) return
+  if (device.getPlatform?.() !== 'android') return
+
+  const now = Date.now()
+  if (now - lastDumpTs < DUMP_THROTTLE_MS) return
+  lastDumpTs = now
+
+  const serial = getSerial()
+  if (!serial) {
+    debugLog(tag, 'no device serial (device.id)')
+    return
+  }
+
+  const state = safeExecAdb(serial, ['get-state'])
+  const reverseList = safeExecAdb(serial, ['reverse', '--list'])
+  const pid = ANDROID_PACKAGE_NAME
+    ? safeExecAdb(serial, ['shell', 'pidof', ANDROID_PACKAGE_NAME])
+    : 'SKIPPED(no STORYBOOK_ANDROID_PACKAGE)'
+
+  // Tail last N lines; still may include noise, but enough to spot crashes/metro issues.
+  const logcatTail = safeExecAdb(serial, ['logcat', '-d', '-t', '250'])
+  const logcatHighlights = pickLogcatHighlights(logcatTail)
+
+  const metro = await checkMetroStatus(1200)
+
+  debugLog(
+    [
+      `\n=== ${tag} ===`,
+      `serial=${serial} adbState=${state}`,
+      `pidof(${ANDROID_PACKAGE_NAME ?? 'N/A'})=${pid}`,
+      `metroStatus=${metro}`,
+      `adb reverse --list:\n${reverseList || '(empty)'}`,
+      `logcat highlights:\n${logcatHighlights || '(none)'}`,
+      `logcat tail:\n${logcatTail || '(empty)'}`,
+      `=== end ${tag} ===\n`,
+    ].join('\n'),
+  )
+}
+
+/**
+ * Lightweight helper if you want reverse list only (kept for compatibility with your current calls).
+ */
+export function debugReverseState(tag: string) {
+  if (!DEBUG) return
+  if (device.getPlatform?.() !== 'android') return
+
+  const serial = getSerial()
+  if (!serial) {
+    debugLog(tag, 'debugReverseState: no device serial (device.id)')
+    return
+  }
+
+  const out = safeExecAdb(serial, ['reverse', '--list'])
+  debugLog(tag, 'adb reverse --list:\n' + out)
+}
+
+// --- Channel implementation ---------------------------------------------------
 
 interface Channel {
   server?: WebSocketServer
@@ -103,13 +217,13 @@ type Message = {
 // Cannot use module scope variable, require during test execution returns different instance.
 // Probably because of transformer.
 function getChannel(): Channel {
-  globalThis.channel = globalThis.channel ?? {
+  ;(globalThis as any).channel = (globalThis as any).channel ?? {
     pendingStory: null,
     routePromise: null,
     serverPromise: null,
   }
 
-  return globalThis.channel
+  return (globalThis as any).channel
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -178,9 +292,7 @@ function createPendingRenderPromise(storyId: string): Promise<void> {
   // New call supersedes any previous pending request
   if (channel.pendingStory) {
     try {
-      channel.pendingStory.reject(
-        new Error(`Superseded pending changeStory("${channel.pendingStory.storyId}")`)
-      )
+      channel.pendingStory.reject(new Error(`Superseded pending changeStory("${channel.pendingStory.storyId}")`))
     } catch {
       // ignore
     }
@@ -206,59 +318,48 @@ function attachClientSocket(socket: WebSocket) {
     }
   }
 
+  const remoteAddress = (socket as any)?._socket?.remoteAddress
+  const remotePort = (socket as any)?._socket?.remotePort
+  debugLog('ws client connected', { remoteAddress, remotePort })
+
   channel.client = {
     socket,
     identifier: channel.client?.identifier,
     connectedAt: Date.now(),
   }
 
-  // Message handler for story events
   socket.on('message', (buffer: Buffer) => {
     const message = safeJsonParse(buffer)
-
-    if (!message) {
-      return
-    }
+    if (!message) return
 
     if (message.type === CHANNEL_CREATED) {
       const from = message.from
-
       if (typeof from === 'string') {
         const currentClient = getChannel().client
-
         if (currentClient?.socket === socket) {
           currentClient.identifier = from
         }
       }
-
       log('CHANNEL_CREATED from:', from)
       return
     }
 
-    // Story error during render: fail pending request immediately
-    // so tests don't hang waiting for render that will never complete.
     if (message.type === STORY_THREW_EXCEPTION) {
       const storyError = message.args?.[0]
       const error = new Error('Story threw exception during render: ' + JSON.stringify(storyError))
-
       rejectPendingStory(error)
       return
     }
 
-    // Story rendered successfully: resolve if storyId matches pending request.
     if (message.type === STORY_RENDERED || message.type === STORY_UNCHANGED) {
       const renderedId = extractStoryIdFromMessage(message)
-
-      if (!renderedId) {
-        return
-      }
+      if (!renderedId) return
 
       const channel = getChannel()
       const pending = channel.pendingStory
 
       if (pending && pending.storyId === renderedId) {
         channel.pendingStory = null
-
         try {
           pending.resolve()
         } catch {
@@ -268,29 +369,27 @@ function attachClientSocket(socket: WebSocket) {
     }
   })
 
-  // Socket close/error: fail pending request immediately.
-  // Without this, tests would hang until timeout when device disconnects.
-  socket.on('close', () => {
+  socket.on('close', async () => {
     log('client socket closed')
 
     const channel = getChannel()
-
     if (channel.client?.socket === socket) {
       channel.client = null
     }
 
+    await debugAndroidTimeoutDump('storybook ws client socket closed')
     rejectPendingStory(new Error('Storybook device socket closed'))
   })
 
-  socket.on('error', (error: any) => {
+  socket.on('error', async (error: any) => {
     log('client socket error:', error?.message ?? error)
 
     const channel = getChannel()
-
     if (channel.client?.socket === socket) {
       channel.client = null
     }
 
+    await debugAndroidTimeoutDump('storybook ws client socket error')
     rejectPendingStory(new Error('Storybook device socket error: ' + (error?.message ?? String(error))))
   })
 }
@@ -305,9 +404,7 @@ async function ensureServerStarted() {
   }
 
   channel.serverPromise = (async () => {
-    if (channel.server) {
-      return
-    }
+    if (channel.server) return
 
     const server = new WebSocketServer({ port: PORT })
     channel.server = server
@@ -317,8 +414,9 @@ async function ensureServerStarted() {
       attachClientSocket(socket)
     })
 
-    server.on('error', (error: any) => {
+    server.on('error', async (error: any) => {
       log('server error:', error?.message ?? error)
+      await debugAndroidTimeoutDump('storybook ws server error')
     })
 
     log('server started on port', PORT)
@@ -331,8 +429,8 @@ export async function prepareChannel() {
   await ensureServerStarted()
 }
 
-// Idempotent reverse port: repeated reverseTcpPort calls can degrade/stall adb,
-// causing "The app seems to be idle" failures. One reverse per Jest process is enough.
+// Idempotent reverse port: repeated reverseTcpPort calls can degrade/stall adb.
+// One reverse per Jest process is enough.
 export async function routeFromDeviceToServer() {
   const channel = getChannel()
 
@@ -355,8 +453,6 @@ export async function routeFromDeviceToServer() {
   return channel.routePromise
 }
 
-// Complete cleanup: reject pending request, close client socket, close server.
-// Resets all promises so next test run starts fresh.
 export async function closeChannel() {
   const channel = getChannel()
 
@@ -390,9 +486,7 @@ export async function closeChannel() {
 
   channel.client = null
 
-  if (!channel.server) {
-    return
-  }
+  if (!channel.server) return
 
   await new Promise<void>((resolve) => channel.server?.close(() => resolve()))
   channel.server = undefined
@@ -404,11 +498,9 @@ async function waitForOpenClientSocket(timeoutMs: number): Promise<WebSocket> {
 
   while (Date.now() - start < timeoutMs) {
     const socket = getChannel().client?.socket
-
     if (socket && (socket as any).readyState === WS_OPEN) {
       return socket
     }
-
     await sleep(100)
   }
 
@@ -419,10 +511,9 @@ export async function changeStory(storyId: string) {
   await ensureServerStarted()
   await routeFromDeviceToServer()
 
-  const connectTimeoutMs = Number(process.env.STORYBOOK_WS_CONNECT_TIMEOUT_MS || 60_000)
-  const changeTimeoutMs = Number(process.env.STORYBOOK_CHANGE_STORY_TIMEOUT_MS || 20_000)
+  const connectTimeoutMs = Number(process.env.STORYBOOK_WS_CONNECT_TIMEOUT_MS || 30_000)
+  const changeTimeoutMs = Number(process.env.STORYBOOK_CHANGE_STORY_TIMEOUT_MS || 15_000)
 
-  // Fallback connect timeout after relaunch: shorter than the initial one by default.
   const fallbackConnectEnv = process.env.STORYBOOK_WS_FALLBACK_CONNECT_TIMEOUT_MS
   const fallbackConnectTimeoutMs = (() => {
     const parsed = fallbackConnectEnv != null ? Number(fallbackConnectEnv) : NaN
@@ -434,38 +525,23 @@ export async function changeStory(storyId: string) {
 
   let socket: WebSocket
 
-  // 1. Try to use an already-connected Storybook client from the app.
   try {
     socket = await waitForOpenClientSocket(connectTimeoutMs)
   } catch (firstError: any) {
-    debugReverseState('changeStory: waitForOpenClientSocket timeout')
+    await debugAndroidTimeoutDump(`changeStory timeout storyId=${storyId}`)
 
     if (!SHOULD_RELAUNCH_ON_WS_TIMEOUT) {
-      // Explicitly disabled via env: surface the original timeout error.
       throw firstError
     }
 
-    log(
-      'No open Storybook WS client within timeout, trying to relaunch app:',
-      firstError?.message ?? firstError,
-    )
+    log('No open Storybook WS client within timeout, trying to relaunch app:', firstError?.message ?? firstError)
 
-    // 2. Try a single recovery relaunch to force the app to reconnect.
-    try {
-      await device.launchApp({ newInstance: true })
-    } catch (launchError: any) {
-      log(
-        'launchApp failed while trying to recover Storybook connection:',
-        launchError?.message ?? launchError,
-      )
-      throw launchError
-    }
+    await device.launchApp({ newInstance: true })
 
-    // 3. After relaunch, wait again for the client but with a shorter timeout.
+    // After relaunch, wait again for the client but with a shorter timeout.
     socket = await waitForOpenClientSocket(fallbackConnectTimeoutMs)
   }
 
-  // 4. Register the pending render before sending SET_CURRENT_STORY to avoid races.
   const waitForRender = createPendingRenderPromise(storyId)
 
   try {
@@ -483,30 +559,14 @@ export async function changeStory(storyId: string) {
       }
       channel.pendingStory = null
     }
+
     throw error
   }
 
   try {
     await withTimeout(`App timed out changing stories: ${storyId}`, waitForRender, changeTimeoutMs)
-  } catch (error: any) {
-    const channel = getChannel()
-
-    if (channel.pendingStory?.storyId === storyId) {
-      const pending = channel.pendingStory
-
-      channel.pendingStory = null
-
-      try {
-        pending.reject(error instanceof Error ? error : new Error(String(error)))
-      } catch {
-        // ignore
-      }
-    }
-
-    throw error
   } finally {
     const channel = getChannel()
-
     if (channel.pendingStory?.storyId === storyId) {
       channel.pendingStory = null
     }
