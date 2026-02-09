@@ -7,6 +7,7 @@ import events, {
   STORY_UNCHANGED,
 } from 'storybook/internal/core-events'
 import { WebSocket, WebSocketServer } from 'ws'
+import { execFileSync } from 'child_process'
 
 const WS_OPEN = 1
 const PORT = Number(process.env.STORYBOOK_WS_PORT || 7007)
@@ -21,6 +22,57 @@ const log = (...args: unknown[]) => {
   if (DEBUG) {
     // eslint-disable-next-line no-console
     console.log('[storybook-detox-channel]', ...args)
+  }
+}
+
+function debugLog(...args: any[]) {
+  // Reuse existing DEBUG flag or add your own
+  if (process.env.STORYBOOK_CHANNEL_DEBUG === '1') {
+    // eslint-disable-next-line no-console
+    console.log('[storybook-detox][debug]', ...args)
+  }
+}
+
+function getAdbDeviceIdFallback(): string | null {
+  // Best-effort: in most CI setups there's only one device.
+  try {
+    const out = execFileSync('adb', ['devices'], { encoding: 'utf8' })
+    const lines = out.split('\n').map((l) => l.trim()).filter(Boolean)
+    const deviceLines = lines.filter((l) => l.endsWith('\tdevice'))
+    if (deviceLines.length === 1) {
+      return deviceLines[0].split('\t')[0]
+    }
+  } catch {
+    // ignore
+  }
+  return null
+}
+
+function getAdbDeviceId(): string | null {
+  // Prefer Detox env if present, fallback to single-device heuristic.
+  const envId = process.env.DETOX_DEVICE_ID || process.env.DETOX_DEVICE_NAME
+  if (envId && envId.length > 0) {
+    return envId
+  }
+  return getAdbDeviceIdFallback()
+}
+
+export function debugReverseState(tag: string) {
+  if (device.getPlatform?.() !== 'android') {
+    return
+  }
+
+  const serial = getAdbDeviceId()
+  if (!serial) {
+    debugLog(tag, 'debugReverseState: no adb device id found')
+    return
+  }
+
+  try {
+    const out = execFileSync('adb', ['-s', serial, 'reverse', '--list'], { encoding: 'utf8' })
+    debugLog(tag, 'adb reverse --list:\n' + out)
+  } catch (e: any) {
+    debugLog(tag, 'adb reverse --list failed:', e?.message ?? String(e))
   }
 }
 
@@ -386,6 +438,8 @@ export async function changeStory(storyId: string) {
   try {
     socket = await waitForOpenClientSocket(connectTimeoutMs)
   } catch (firstError: any) {
+    debugReverseState('changeStory: waitForOpenClientSocket timeout')
+
     if (!SHOULD_RELAUNCH_ON_WS_TIMEOUT) {
       // Explicitly disabled via env: surface the original timeout error.
       throw firstError

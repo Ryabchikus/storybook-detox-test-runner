@@ -131,6 +131,9 @@ function generateJestTest (csfFilePath: string, stories: Record<string, StaticSt
           console.warn(
             \`[storybook-detox] launchApp retry attempt=\${attempt}/\${MAX_LAUNCH_RETRIES} after disconnect\`,
           )
+
+          debugReverseState('launchAppWithRetry: before retry')
+
           await _sleep(1000)
         }
       }
