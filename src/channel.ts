@@ -29,7 +29,7 @@ const log = (...args: unknown[]) => {
   }
 }
 
-// --- Debug helpers (Android only) --------------------------------------------
+// --- Debug helpers (Android only, best-effort, must never touch Detox API) ----
 
 const debugLog = (...args: any[]) => {
   if (!DEBUG) return
@@ -42,25 +42,18 @@ const getAdbPath = () => {
   return sdkRoot ? path.join(sdkRoot, 'platform-tools', 'adb') : 'adb'
 }
 
-const getSerial = (): string | null => {
-  const id = (device as any)?.id
-  return typeof id === 'string' && id.length > 0 ? id : null
-}
-
-const safeExecAdb = (serial: string, args: string[]) => {
-  try {
-    return execFileSync(getAdbPath(), ['-s', serial, ...args], { encoding: 'utf8' }).trim()
-  } catch (e: any) {
-    return `FAILED: ${String(e?.stderr || e?.message || e)}`
-  }
-}
-
 const safeExec = (cmd: string, args: string[]) => {
   try {
     return execFileSync(cmd, args, { encoding: 'utf8' }).trim()
   } catch (e: any) {
     return `FAILED: ${String(e?.stderr || e?.message || e)}`
   }
+}
+
+const safeExecAdb = (serial: string | null, args: string[]) => {
+  const adb = getAdbPath()
+  const fullArgs = serial ? ['-s', serial, ...args] : args
+  return safeExec(adb, fullArgs)
 }
 
 // Prevent flooding logs when multiple stories fail in a row
@@ -93,8 +86,7 @@ async function checkMetroStatus(timeoutMs = 1200): Promise<string> {
 }
 
 function pickLogcatHighlights(logcat: string): string {
-  // Keep it very pragmatic: these strings cover 95% of "why didn't it connect?"
-  // You can extend via env without changing code.
+  // Pragmatic needles for "why didn't the app connect to WS/Metro?"
   const extra = String(process.env.STORYBOOK_LOGCAT_HIGHLIGHTS || '')
     .split(',')
     .map((s) => s.trim())
@@ -108,8 +100,6 @@ function pickLogcatHighlights(logcat: string): string {
     'Unable to load script',
     'Could not connect to development server',
     'ReactNativeJS',
-    'Hermes',
-    'SoLoader',
     'ConnectException',
     'ECONNREFUSED',
     'EHOSTUNREACH',
@@ -117,50 +107,79 @@ function pickLogcatHighlights(logcat: string): string {
     '7007',
     '8081',
     '::1',
+    'localhost',
     ...extra,
   ]
 
   const lines = (logcat || '').split('\n')
   const matched = lines.filter((l) => needles.some((n) => l.includes(n)))
-
-  // Limit size to avoid blowing up logs
   return matched.slice(-120).join('\n')
+}
+
+function parseSingleAdbDeviceId(): string | null {
+  // Best-effort heuristic: if exactly one device is attached, use it.
+  const out = safeExec(getAdbPath(), ['devices'])
+  if (!out || out.startsWith('FAILED:')) return null
+
+  const lines = out
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+
+  const deviceLines = lines.filter((l) => l.endsWith('\tdevice'))
+  if (deviceLines.length !== 1) return null
+
+  return deviceLines[0].split('\t')[0] || null
+}
+
+function resolveAdbSerial(): string | null {
+  const channel = getChannel()
+
+  // 1) Cached value (set when Detox is definitely alive)
+  if (channel.adbSerial && typeof channel.adbSerial === 'string') {
+    return channel.adbSerial
+  }
+
+  // 2) Env (if provided by CI)
+  const envId = process.env.DETOX_DEVICE_ID || process.env.DETOX_DEVICE_NAME
+  if (envId && envId.length > 0) {
+    return envId
+  }
+
+  // 3) Fallback: single connected device
+  return parseSingleAdbDeviceId()
 }
 
 /**
  * Dumps Android diagnostics to stdout. Best-effort: must never throw.
- * Call it on timeouts / disconnects only.
+ * Safe to call from any async callback (even after Detox teardown).
  */
 export async function debugAndroidTimeoutDump(tag: string) {
   if (!DEBUG) return
-  if (device.getPlatform?.() !== 'android') return
 
   const now = Date.now()
   if (now - lastDumpTs < DUMP_THROTTLE_MS) return
   lastDumpTs = now
 
-  const serial = getSerial()
-  if (!serial) {
-    debugLog(tag, 'no device serial (device.id)')
-    return
-  }
+  // Do not use Detox API here. Only adb/env/cached values.
+  const serial = resolveAdbSerial()
 
-  const state = safeExecAdb(serial, ['get-state'])
-  const reverseList = safeExecAdb(serial, ['reverse', '--list'])
-  const pid = ANDROID_PACKAGE_NAME
-    ? safeExecAdb(serial, ['shell', 'pidof', ANDROID_PACKAGE_NAME])
-    : 'SKIPPED(no STORYBOOK_ANDROID_PACKAGE)'
+  const state = serial ? safeExecAdb(serial, ['get-state']) : 'SKIPPED(no-serial)'
+  const reverseList = serial ? safeExecAdb(serial, ['reverse', '--list']) : 'SKIPPED(no-serial)'
+  const pid =
+    serial && ANDROID_PACKAGE_NAME
+      ? safeExecAdb(serial, ['shell', 'pidof', ANDROID_PACKAGE_NAME])
+      : 'SKIPPED(no serial or STORYBOOK_ANDROID_PACKAGE)'
 
-  // Tail last N lines; still may include noise, but enough to spot crashes/metro issues.
-  const logcatTail = safeExecAdb(serial, ['logcat', '-d', '-t', '250'])
-  const logcatHighlights = pickLogcatHighlights(logcatTail)
+  const logcatTail = serial ? safeExecAdb(serial, ['logcat', '-d', '-t', '250']) : 'SKIPPED(no-serial)'
+  const logcatHighlights = typeof logcatTail === 'string' ? pickLogcatHighlights(logcatTail) : ''
 
   const metro = await checkMetroStatus(1200)
 
   debugLog(
     [
       `\n=== ${tag} ===`,
-      `serial=${serial} adbState=${state}`,
+      `serial=${serial ?? 'N/A'} adbState=${state}`,
       `pidof(${ANDROID_PACKAGE_NAME ?? 'N/A'})=${pid}`,
       `metroStatus=${metro}`,
       `adb reverse --list:\n${reverseList || '(empty)'}`,
@@ -172,19 +191,12 @@ export async function debugAndroidTimeoutDump(tag: string) {
 }
 
 /**
- * Lightweight helper if you want reverse list only (kept for compatibility with your current calls).
+ * Lightweight helper: reverse list only.
  */
 export function debugReverseState(tag: string) {
   if (!DEBUG) return
-  if (device.getPlatform?.() !== 'android') return
-
-  const serial = getSerial()
-  if (!serial) {
-    debugLog(tag, 'debugReverseState: no device serial (device.id)')
-    return
-  }
-
-  const out = safeExecAdb(serial, ['reverse', '--list'])
+  const serial = resolveAdbSerial()
+  const out = serial ? safeExecAdb(serial, ['reverse', '--list']) : 'SKIPPED(no-serial)'
   debugLog(tag, 'adb reverse --list:\n' + out)
 }
 
@@ -200,6 +212,9 @@ interface Channel {
   pendingStory: PendingStoryRender | null
   routePromise: Promise<void> | null
   serverPromise: Promise<void> | null
+
+  // Cached adb serial; set only from places where Detox is alive.
+  adbSerial: string | null
 }
 
 type PendingStoryRender = {
@@ -214,13 +229,12 @@ type Message = {
   args?: any[]
 }
 
-// Cannot use module scope variable, require during test execution returns different instance.
-// Probably because of transformer.
 function getChannel(): Channel {
   ;(globalThis as any).channel = (globalThis as any).channel ?? {
     pendingStory: null,
     routePromise: null,
     serverPromise: null,
+    adbSerial: null,
   }
 
   return (globalThis as any).channel
@@ -253,8 +267,6 @@ function safeJsonParse(buffer: Buffer): Message | null {
   }
 }
 
-// Supports both string storyId and object { storyId: string } payload formats
-// to maintain backward compatibility with different Storybook versions.
 function extractStoryIdFromMessage(message: Message): string | null {
   const firstArg = message?.args?.[0]
 
@@ -272,10 +284,7 @@ function extractStoryIdFromMessage(message: Message): string | null {
 function rejectPendingStory(error: Error) {
   const channel = getChannel()
   const pending = channel.pendingStory
-
-  if (!pending) {
-    return
-  }
+  if (!pending) return
 
   channel.pendingStory = null
 
@@ -289,7 +298,6 @@ function rejectPendingStory(error: Error) {
 function createPendingRenderPromise(storyId: string): Promise<void> {
   const channel = getChannel()
 
-  // New call supersedes any previous pending request
   if (channel.pendingStory) {
     try {
       channel.pendingStory.reject(new Error(`Superseded pending changeStory("${channel.pendingStory.storyId}")`))
@@ -308,8 +316,6 @@ function attachClientSocket(socket: WebSocket) {
   const channel = getChannel()
   const previousSocket = channel.client?.socket
 
-  // When app restarts during tests, a new socket connects.
-  // Close the old one to prevent stale sockets and listener accumulation.
   if (previousSocket && previousSocket !== socket) {
     try {
       previousSocket.close()
@@ -346,8 +352,7 @@ function attachClientSocket(socket: WebSocket) {
 
     if (message.type === STORY_THREW_EXCEPTION) {
       const storyError = message.args?.[0]
-      const error = new Error('Story threw exception during render: ' + JSON.stringify(storyError))
-      rejectPendingStory(error)
+      rejectPendingStory(new Error('Story threw exception during render: ' + JSON.stringify(storyError)))
       return
     }
 
@@ -369,7 +374,7 @@ function attachClientSocket(socket: WebSocket) {
     }
   })
 
-  socket.on('close', async () => {
+  socket.on('close', () => {
     log('client socket closed')
 
     const channel = getChannel()
@@ -377,11 +382,12 @@ function attachClientSocket(socket: WebSocket) {
       channel.client = null
     }
 
-    await debugAndroidTimeoutDump('storybook ws client socket closed')
+    // Never await in event handler; keep it fire-and-forget and safe.
+    void debugAndroidTimeoutDump('storybook ws client socket closed')
     rejectPendingStory(new Error('Storybook device socket closed'))
   })
 
-  socket.on('error', async (error: any) => {
+  socket.on('error', (error: any) => {
     log('client socket error:', error?.message ?? error)
 
     const channel = getChannel()
@@ -389,13 +395,11 @@ function attachClientSocket(socket: WebSocket) {
       channel.client = null
     }
 
-    await debugAndroidTimeoutDump('storybook ws client socket error')
+    void debugAndroidTimeoutDump('storybook ws client socket error')
     rejectPendingStory(new Error('Storybook device socket error: ' + (error?.message ?? String(error))))
   })
 }
 
-// Idempotent server start: multiple spec files call prepareChannel() in beforeAll,
-// but we need exactly one WebSocket server per Jest process to avoid port conflicts.
 async function ensureServerStarted() {
   const channel = getChannel()
 
@@ -414,9 +418,9 @@ async function ensureServerStarted() {
       attachClientSocket(socket)
     })
 
-    server.on('error', async (error: any) => {
+    server.on('error', (error: any) => {
       log('server error:', error?.message ?? error)
-      await debugAndroidTimeoutDump('storybook ws server error')
+      void debugAndroidTimeoutDump('storybook ws server error')
     })
 
     log('server started on port', PORT)
@@ -429,8 +433,6 @@ export async function prepareChannel() {
   await ensureServerStarted()
 }
 
-// Idempotent reverse port: repeated reverseTcpPort calls can degrade/stall adb.
-// One reverse per Jest process is enough.
 export async function routeFromDeviceToServer() {
   const channel = getChannel()
 
@@ -440,10 +442,19 @@ export async function routeFromDeviceToServer() {
 
   channel.routePromise = (async () => {
     try {
+      // Cache serial while Detox is alive; do not read it in debug callbacks later.
+      try {
+        const id = (device as any)?.id
+        if (typeof id === 'string' && id.length > 0) {
+          channel.adbSerial = id
+        }
+      } catch {
+        // ignore
+      }
+
       await device.reverseTcpPort(PORT)
       log('reverseTcpPort ok:', PORT)
     } catch (error: any) {
-      // Allow retry on next call if reverse failed (e.g., adb restart needed).
       channel.routePromise = null
       log('reverseTcpPort failed:', error?.message ?? error)
       throw error
@@ -511,8 +522,8 @@ export async function changeStory(storyId: string) {
   await ensureServerStarted()
   await routeFromDeviceToServer()
 
-  const connectTimeoutMs = Number(process.env.STORYBOOK_WS_CONNECT_TIMEOUT_MS || 30_000)
-  const changeTimeoutMs = Number(process.env.STORYBOOK_CHANGE_STORY_TIMEOUT_MS || 15_000)
+  const connectTimeoutMs = Number(process.env.STORYBOOK_WS_CONNECT_TIMEOUT_MS || 60_000)
+  const changeTimeoutMs = Number(process.env.STORYBOOK_CHANGE_STORY_TIMEOUT_MS || 20_000)
 
   const fallbackConnectEnv = process.env.STORYBOOK_WS_FALLBACK_CONNECT_TIMEOUT_MS
   const fallbackConnectTimeoutMs = (() => {
@@ -538,7 +549,6 @@ export async function changeStory(storyId: string) {
 
     await device.launchApp({ newInstance: true })
 
-    // After relaunch, wait again for the client but with a shorter timeout.
     socket = await waitForOpenClientSocket(fallbackConnectTimeoutMs)
   }
 
@@ -551,9 +561,7 @@ export async function changeStory(storyId: string) {
 
     if (channel.pendingStory?.storyId === storyId) {
       try {
-        channel.pendingStory.reject(
-          new Error('Failed to send SET_CURRENT_STORY: ' + (error?.message ?? String(error))),
-        )
+        channel.pendingStory.reject(new Error('Failed to send SET_CURRENT_STORY: ' + (error?.message ?? String(error))))
       } catch {
         // ignore
       }
