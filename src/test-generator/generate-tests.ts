@@ -155,8 +155,16 @@ function generateJestTest (csfFilePath: string, stories: Record<string, StaticSt
 function generateTestForStory (variableName: string, story: StaticStory) {
   return `
     testOrSkip(story.${variableName}.detox?.onlyOnOperatingSystems)('${story.name}', async function () {
+      console.log('[storybook-detox][phase]', '${story.id}', 'launchApp:start')
       await launchAppWithRetry(story.${variableName}.detox?.launch)
+      console.log('[storybook-detox][phase]', '${story.id}', 'launchApp:done')
+
+      console.log('[storybook-detox][phase]', '${story.id}', 'changeStory:start')
       await channel.changeStory('${story.id}')
+      console.log('[storybook-detox][phase]', '${story.id}', 'changeStory:done')
+
+      console.log('[storybook-detox][phase]', '${story.id}', 'play:start')
       await story.${variableName}.play?.({ detox })
+      console.log('[storybook-detox][phase]', '${story.id}', 'play:done')
     })\n\n`
 }
