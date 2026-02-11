@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process'
-import http from 'http'
+import net from 'net'
 import path from 'path'
 import { device } from 'detox'
 import events, {
@@ -62,26 +62,17 @@ const DUMP_THROTTLE_MS = 5000
 
 async function checkMetroStatus(timeoutMs = 1200): Promise<string> {
   return await new Promise((resolve) => {
-    const req = http.get(
-      {
-        host: '127.0.0.1',
-        port: 8081,
-        path: '/status',
-        timeout: timeoutMs,
-      },
-      (res) => {
-        let data = ''
-        res.on('data', (c) => (data += String(c)))
-        res.on('end', () => resolve(`HTTP ${res.statusCode} ${data.slice(0, 200)}`))
-      },
-    )
+    const socket = net.createConnection({ host: '127.0.0.1', port: 8081 })
 
-    req.on('timeout', () => {
-      req.destroy()
-      resolve('TIMEOUT')
-    })
+    const done = (msg: string) => {
+      try { socket.destroy() } catch {}
+      resolve(msg)
+    }
 
-    req.on('error', (e) => resolve(`ERROR: ${String((e as any)?.message ?? e)}`))
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => done('TCP OK'))
+    socket.once('timeout', () => done('TCP TIMEOUT'))
+    socket.once('error', (e) => done(`TCP ERROR: ${String((e as any)?.message ?? e)}`))
   })
 }
 

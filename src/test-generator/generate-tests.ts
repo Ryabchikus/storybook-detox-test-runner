@@ -137,6 +137,7 @@ function generateJestTest (csfFilePath: string, stories: Record<string, StaticSt
     }
 
     beforeAll(async () => {
+      await channel.prepareChannel()
       await channel.routeFromDeviceToServer()
     })
 
