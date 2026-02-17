@@ -285,6 +285,10 @@ export async function routeFromDeviceToServer() {
 
   channel.routePromise = (async () => {
     try {
+      if (device.getPlatform() !== 'android') {
+        return
+      }
+
       await device.reverseTcpPort(PORT)
       log('reverseTcpPort ok:', PORT)
     } catch (error: any) {
